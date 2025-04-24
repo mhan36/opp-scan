@@ -8,14 +8,25 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "nvs_flash.h"
-// #include "esp_timer.h"
+#include "esp_timer.h"
+#include "uthash.h"
 
-static const char *TAG = "DEBUG ";
-int counter = 0;
+#define PROBE_PERIOD_MS 120
+#define MAX_SCAN_RESULTS 10
 
-static TimerHandle_t listen_timer;
+// Struct to hold scan results, from inject.c
+typedef struct scan_result_t
+{
+    uint8_t bssid[6];  // BSSID (MAC address)
+    uint8_t ssid[33];  // SSID
+    uint8_t channel;   // Wi-Fi channel
+    int8_t rssi;       // Signal strength (RSSI)
+    bool updated;      // Flag to indicate if this entry was updated in the current iteration
+    UT_hash_handle hh; // Hash table handle
+    // add field to verify that the probe response for this result was heard
+} scan_result_t;
 
-// Construct the probe request frame
+// Manually construct the probe request frame, from inject.c
 static uint8_t probe_request[64] = {
     0x40, 0x00,                         // Frame Control (0x40 = probe request)
     0x00, 0x00,                         // Duration
@@ -34,83 +45,207 @@ static uint8_t probe_request[64] = {
     0x32, 0x04, 0x0C, 0x18, 0x30, 0x60 // Extended Supported Rates (6, 12, 24, 54 Mbps)
 };
 
+static const char *TAG = "DEBUG ";
+
+static DRAM_ATTR scan_result_t *scan_results = NULL; // Hash table for storing unique scan results, from inject.c
+
+static int64_t last_sniff_time_us = 0; // timestamp that the last packet was sniffed
+
+static int num_scan_results = 0;
+
+/************************************************************
+ *                SCAN RESULTS AND HASH                     *
+ *                -Primarily sourced from inject.c          *
+ ************************************************************/
+
+// Add a scan result to the hash set
+static inline void IRAM_ATTR add_scan_result(
+    uint8_t *bssid,
+    uint8_t *ssid,
+    uint8_t ssid_len,
+    uint8_t channel,
+    int8_t rssi)
+{
+    // Check if we exceed maximum scan count.
+    if (HASH_COUNT(scan_results) >= MAX_SCAN_RESULTS)
+        return;
+
+    // Check if the BSSID is already in the hash set
+    scan_result_t *result;
+    HASH_FIND(hh, scan_results, bssid, 6, result);
+
+    if (result)
+    {
+        // Update the existing entry
+        result->channel = channel;
+        result->rssi = rssi;
+        result->updated = true; // Mark as updated
+    }
+    else
+    {
+        // Create a new entry
+        result = (scan_result_t *)malloc(sizeof(scan_result_t));
+        memcpy(result->bssid, bssid, 6);
+        memcpy(result->ssid, ssid, ssid_len);
+        result->ssid[ssid_len] = '\0'; // Ensure SSID is null-terminated
+        result->channel = channel;
+        result->rssi = rssi;
+        result->updated = true; // Mark as updated
+
+        // Add to the hash set
+        HASH_ADD(hh, scan_results, bssid, 6, result);
+    }
+}
+
+// Function to clear the entire hash set
+static inline void IRAM_ATTR clear_scan_results()
+{
+    scan_result_t *current_entry, *tmp;
+
+    // Iterate over the hash set and reset each entry
+    HASH_ITER(hh, scan_results, current_entry, tmp)
+    {
+        current_entry->updated = false; // Reset the updated flag
+    }
+}
+
+// Debug Function to print the number of items in the hash set
+static inline void IRAM_ATTR print_num_scan_results()
+{
+    unsigned int num_items = HASH_COUNT(scan_results); // Use HASH_COUNT to get the number of items
+    printf("Scan results: %u\n", num_items);
+}
+
+// Debug Function to print all entries in the hash set
+static inline void IRAM_ATTR print_scan_results()
+{
+    scan_result_t *current_entry, *tmp;
+
+    // Iterate over the hash set and print each entry
+    HASH_ITER(hh, scan_results, current_entry, tmp)
+    {
+        printf("BSSID: %02x:%02x:%02x:%02x:%02x:%02x, SSID: %s, Channel: %d, RSSI: %d dBm\n",
+               current_entry->bssid[0], current_entry->bssid[1], current_entry->bssid[2],
+               current_entry->bssid[3], current_entry->bssid[4], current_entry->bssid[5],
+               current_entry->ssid, current_entry->channel, current_entry->rssi);
+    }
+}
+
+/************************************************************
+ *                      PROBING BEHAVIOR                    *
+ ************************************************************/
+
+bool is_probe_request(void *buff)
+{
+    wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buff;
+    uint8_t *payload = ppkt->payload;
+    return (payload[0] & 0xFC) == 0x40;
+}
+
+// timer_cb and send_probe_request() can probably be combined for simplicity if not needed
 static void send_probe_request()
 {
     esp_wifi_80211_tx(WIFI_IF_STA, probe_request, sizeof(probe_request), false);
     ESP_LOGI(TAG, "Wildcard probe request sent.");
 }
 
-static void listen_cb(TimerHandle_t xTimer)
+static void timer_cb()
 {
-    send_probe_request();
+    int64_t now = esp_timer_get_time();
+    int64_t time_since_sniff = now - last_sniff_time_us;
+
+    if (time_since_sniff >= 3000000 || last_sniff_time_us == 0) // this is "time delta" between probe bursts when in a silent env
+    {
+        send_probe_request(); // if no probe detected for 3 seconds (magic number), we probe ourselves (wildcard for now)
+    }
+    else
+    {
+        // ESP_LOGI(TAG, "SKIPPED PROBE");
+    }
 }
 
-/**
- * Callback when packets are received in monitor mode
- */
-static void listen_handler(void *buff, wifi_promiscuous_pkt_type_t type)
+// Callback when packets are received in monitor mode
+void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type)
 {
     if (type != WIFI_PKT_MGMT) // filter for management frames only
     {
         return;
     }
 
+    if (!is_probe_request(buff))
+    { // drop the packet if its not a probe
+        return;
+    }
+
+    last_sniff_time_us = esp_timer_get_time(); // update last time we sniffed
+
     wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buff;
     uint8_t *payload = ppkt->payload;
     int packet_len = ppkt->rx_ctrl.sig_len;
-
-    // Check if it's a Probe Request
-    if ((payload[0] & 0xFC) == 0x40)
+    if (packet_len < 38)
     {
-        if (counter == 10)
-        {
-            send_probe_request();
-            xTimerReset(listen_timer, 0);
-            counter = 0;
-            return;
-        }
-
-        // 24 bytes of MAC header, start parsing ie
-        uint8_t *ies = payload + 24;
-        int ies_len = packet_len - 24;
-
-        int pos = 0;
-        char ssid[33] = {0}; // null terminate after 32 bytes
-        while (pos < ies_len)
-        {
-            uint8_t id = ies[pos];
-            uint8_t length = ies[pos + 1];
-
-            if (id == 0x00) // SSID Element ID
-            {
-                if (length == 0)
-                {
-                    strcpy(ssid, "WILDCARD");
-                }
-                else
-                {
-                    int copy_len = (length > 32) ? 32 : length;
-                    memcpy(ssid, ies + pos + 2, copy_len);
-                    ssid[copy_len] = '\0'; // null termination
-                    break;
-                }
-            }
-            pos += 2 + length;
-        }
-
-        uint8_t *bssid = ppkt->payload + 10; // BSSID is located at offset 10
-
-        int8_t rssi = ppkt->rx_ctrl.rssi;
-        uint8_t channel = ppkt->rx_ctrl.channel;
-
-        printf("BSSID: %02x:%02x:%02x:%02x:%02x:%02x, Channel: %d, RSSI: %d, SSID: %s\n",
-               bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
-               channel,
-               rssi,
-               ssid);
+        return; // bad packet, causes memory to crash
     }
-    counter++;
+
+    // 24 bytes of MAC header, start parsing ie
+    uint8_t *ies = payload + 24;
+    int ies_len = packet_len - 24;
+
+    int pos = 0;
+    char ssid_str[33] = {0}; // null terminate after 32 bytes
+    while (pos < ies_len)
+    {
+        uint8_t id = ies[pos];
+        uint8_t length = ies[pos + 1];
+
+        if (id == 0x00) // SSID Element ID
+        {
+            if (length == 0)
+            {
+                strcpy(ssid_str, "WILDCARD");
+            }
+            else
+            {
+                int copy_len = (length > 32) ? 32 : length;
+                memcpy(ssid_str, ies + pos + 2, copy_len);
+                ssid_str[copy_len] = '\0'; // null termination
+                break;
+            }
+        }
+        pos += 2 + length;
+    }
+
+    uint8_t *bssid = ppkt->payload + 10; // BSSID is located at offset 10
+
+    int8_t ssid_len = ppkt->payload[37]; // SSID length is 1 byte after the Element ID
+    uint8_t *ssid = ppkt->payload + 38;  // SSID starts after length byte
+
+    int8_t rssi = ppkt->rx_ctrl.rssi;
+    uint8_t channel = ppkt->rx_ctrl.channel;
+
+    if (num_scan_results < MAX_SCAN_RESULTS)
+    {
+        add_scan_result(bssid, ssid, ssid_len, channel, rssi);
+        num_scan_results += 1;
+    }
+    // else
+    // {
+    //     // print_scan_results();
+    //     // clear_scan_results();
+    //     // num_scan_results = 0;
+    //     return;
+    // }
+
+    printf("BSSID: %02x:%02x:%02x:%02x:%02x:%02x, Channel: %d, RSSI: %d, SSID: %s\n",
+           bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+           channel,
+           rssi,
+           ssid_str);
 }
+
+/************************************************************
+ *                  WIFI INIT AND MAIN                      *
+ ************************************************************/
 
 // Initialize Wi-Fi stack to inject packets.
 void wifi_init()
@@ -177,11 +312,20 @@ void app_main(void)
     // initialize wifi
     wifi_init();
 
-    // creates a timer with a callback "listen_cb"
-    listen_timer = xTimerCreate("listen_timer", pdMS_TO_TICKS(1000), pdFALSE, NULL, listen_cb);
-    xTimerStart(listen_timer, 0);
+    // Create a timer to periodically send probe requests.
+    esp_timer_create_args_t timer_args = {
+        .callback = &timer_cb,             // Callback function
+        .arg = NULL,                       // Argument passed to the callback
+        .dispatch_method = ESP_TIMER_TASK, // ESP_TIEMR_ISR does not seem to be supported for version 5.x
+        // .dispatch_method = ESP_TIMER_ISR, // Call callback in a task context
+        .name = "probe_cb" // Name of the timer (for debugging)
+    };
 
-    ESP_LOGI(TAG, "Scanning started.");
+    esp_timer_handle_t timer_handle;
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer_handle));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(timer_handle, PROBE_PERIOD_MS * 1000)); // 1,000,000 microseconds = 1 second
+
+    ESP_LOGI(TAG, "opp-scan start");
 
     // uint8_t mac[6];
     // esp_read_mac(mac, ESP_MAC_WIFI_STA); // Read the MAC address for Wi-Fi station
@@ -190,3 +334,17 @@ void app_main(void)
     //        mac[0], mac[1], mac[2],
     //        mac[3], mac[4], mac[5]);
 }
+
+/************************************************************
+ *                TODO LIST
+ * -sniff probe responses, to verify that AP exists, add
+ * boolean field to the scan_result struct
+ *
+ * -construct probes to send out from ourselves, only VERIFIED
+ * APs
+ *
+ * -channel hopping
+ *
+ * -interface swapping(?) need to read more about the interfaces,
+ * potentially dont need to swap and we can do it with one
+ ************************************************************/
