@@ -334,17 +334,3 @@ void app_main(void)
     //        mac[0], mac[1], mac[2],
     //        mac[3], mac[4], mac[5]);
 }
-
-/************************************************************
- *                TODO LIST
- * -sniff probe responses, to verify that AP exists, add
- * boolean field to the scan_result struct
- *
- * -construct probes to send out from ourselves, only VERIFIED
- * APs
- *
- * -channel hopping
- *
- * -interface swapping(?) need to read more about the interfaces,
- * potentially dont need to swap and we can do it with one
- ************************************************************/
