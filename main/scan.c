@@ -12,7 +12,8 @@
 #include "uthash.h"
 
 #define PROBE_PERIOD_MS 120
-#define MAX_SCAN_RESULTS 10
+#define MAX_SCAN_RESULTS 30
+#define CHANNELS_SCANNED 3
 
 // Struct to hold scan results, from inject.c
 typedef struct scan_result_t
@@ -23,7 +24,7 @@ typedef struct scan_result_t
     int8_t rssi;       // Signal strength (RSSI)
     bool updated;      // Flag to indicate if this entry was updated in the current iteration
     UT_hash_handle hh; // Hash table handle
-    // add field to verify that the probe response for this result was heard
+    int recvResponse;  // Flag to indicate that a probe response was heard for this particular ssid
 } scan_result_t;
 
 // Manually construct the probe request frame, from inject.c
@@ -53,6 +54,9 @@ static int64_t last_sniff_time_us = 0; // timestamp that the last packet was sni
 
 static int num_scan_results = 0;
 
+static const uint8_t chan_arr[] = {1, 6, 11};
+static int chan_idx = 2;
+
 /************************************************************
  *                SCAN RESULTS AND HASH                     *
  *                -Primarily sourced from inject.c          *
@@ -64,7 +68,8 @@ static inline void IRAM_ATTR add_scan_result(
     uint8_t *ssid,
     uint8_t ssid_len,
     uint8_t channel,
-    int8_t rssi)
+    int8_t rssi,
+    bool is_probe_resp)
 {
     // Check if we exceed maximum scan count.
     if (HASH_COUNT(scan_results) >= MAX_SCAN_RESULTS)
@@ -80,9 +85,18 @@ static inline void IRAM_ATTR add_scan_result(
         result->channel = channel;
         result->rssi = rssi;
         result->updated = true; // Mark as updated
+
+        if (is_probe_resp)
+        {
+            result->recvResponse = 1;
+        }
     }
     else
     {
+        if (is_probe_resp) // only add new entry if it is a probe req, change this later to support probe resp
+        {
+            return;
+        }
         // Create a new entry
         result = (scan_result_t *)malloc(sizeof(scan_result_t));
         memcpy(result->bssid, bssid, 6);
@@ -134,6 +148,19 @@ static inline void IRAM_ATTR print_scan_results()
 /************************************************************
  *                      PROBING BEHAVIOR                    *
  ************************************************************/
+static void switch_channels()
+{
+    if (chan_idx + 1 == CHANNELS_SCANNED)
+    {
+        chan_idx = 0;
+    }
+    else
+    {
+        chan_idx += 1;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_set_channel(chan_arr[chan_idx], WIFI_SECOND_CHAN_NONE)); // switch channels
+}
 
 bool is_probe_request(void *buff)
 {
@@ -142,11 +169,18 @@ bool is_probe_request(void *buff)
     return (payload[0] & 0xFC) == 0x40;
 }
 
+bool is_probe_response(void *buff)
+{
+    wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buff;
+    uint8_t *payload = ppkt->payload;
+    return (payload[0] & 0xFC) == 0x50;
+}
+
 // timer_cb and send_probe_request() can probably be combined for simplicity if not needed
 static void send_probe_request()
 {
     esp_wifi_80211_tx(WIFI_IF_STA, probe_request, sizeof(probe_request), false);
-    ESP_LOGI(TAG, "Wildcard probe request sent.");
+    ESP_LOGI(TAG, "Wildcard probe request sent. Channel : %d ", chan_arr[chan_idx]);
 }
 
 static void timer_cb()
@@ -156,6 +190,7 @@ static void timer_cb()
 
     if (time_since_sniff >= 3000000 || last_sniff_time_us == 0) // this is "time delta" between probe bursts when in a silent env
     {
+        switch_channels();
         send_probe_request(); // if no probe detected for 3 seconds (magic number), we probe ourselves (wildcard for now)
     }
     else
@@ -172,11 +207,15 @@ void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type)
         return;
     }
 
-    if (!is_probe_request(buff))
-    { // drop the packet if its not a probe
+    bool is_probe_req = is_probe_request(buff);
+    bool is_probe_resp = is_probe_response(buff);
+
+    if (!is_probe_req && !is_probe_resp)
+    { // drop packet if its not a probe resp or req
         return;
     }
 
+    switch_channels();
     last_sniff_time_us = esp_timer_get_time(); // update last time we sniffed
 
     wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buff;
@@ -225,7 +264,7 @@ void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type)
 
     if (num_scan_results < MAX_SCAN_RESULTS)
     {
-        add_scan_result(bssid, ssid, ssid_len, channel, rssi);
+        add_scan_result(bssid, ssid, ssid_len, channel, rssi, is_probe_resp);
         num_scan_results += 1;
     }
     // else
@@ -236,11 +275,20 @@ void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type)
     //     return;
     // }
 
-    printf("BSSID: %02x:%02x:%02x:%02x:%02x:%02x, Channel: %d, RSSI: %d, SSID: %s\n",
+    scan_result_t *result;
+    HASH_FIND(hh, scan_results, bssid, 6, result);
+    int found = 0;
+    if (result)
+    {
+        found = result->recvResponse;
+    }
+
+    printf("BSSID: %02x:%02x:%02x:%02x:%02x:%02x, Channel: %d, RSSI: %d, SSID: %s, RESP RECV : %d \n",
            bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
            channel,
            rssi,
-           ssid_str);
+           ssid_str,
+           found);
 }
 
 /************************************************************
@@ -297,7 +345,8 @@ void wifi_init()
     ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(84));
 
     // Set channel.
-    ESP_ERROR_CHECK(esp_wifi_set_channel(10, WIFI_SECOND_CHAN_NONE));
+    // ESP_ERROR_CHECK(esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_channel(chan_arr[chan_idx], WIFI_SECOND_CHAN_NONE));
 
     // Set bandwidth.
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
