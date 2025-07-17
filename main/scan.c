@@ -11,9 +11,28 @@
 #include "esp_timer.h"
 #include "uthash.h"
 
-#define PROBE_PERIOD_MS 120
+#define PROBE_DELAY_X 100
+#define PROBE_DEALY_2X (2 * PROBE_DELAY_X)
+#define MIN_CHAN_TIME 5
+#define MAX_CHAN_TIME 40 // how long we wait on a channel during opp-scan
 #define MAX_SCAN_RESULTS 30
-#define CHANNELS_SCANNED 3
+#define NUM_CHANNELS 14 // 14 chan on 2.4 ghz
+
+static void probe_timer_cb();
+static void maxChan_timer_cb();
+static void switch_to_next_channel();
+static void init_timers();
+static void send_probe_request();
+static void finished_dynamo_probe();
+static void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type);
+
+// Timer handles
+static esp_timer_handle_t probe_timer_handle;
+static esp_timer_handle_t maxChan_timer_handle;
+
+//***********************************************************************
+//*                                                                     *
+//************************************************************************
 
 // Struct to hold scan results, from inject.c
 typedef struct scan_result_t
@@ -22,9 +41,8 @@ typedef struct scan_result_t
     uint8_t ssid[33];  // SSID
     uint8_t channel;   // Wi-Fi channel
     int8_t rssi;       // Signal strength (RSSI)
-    bool updated;      // Flag to indicate if this entry was updated in the current iteration
     UT_hash_handle hh; // Hash table handle
-    int recvResponse;  // Flag to indicate that a probe response was heard for this particular ssid
+    bool recvResponse; // Flag to indicate that a probe response was heard for this particular ssid
 } scan_result_t;
 
 // Manually construct the probe request frame, from inject.c
@@ -50,12 +68,102 @@ static const char *TAG = "DEBUG ";
 
 static DRAM_ATTR scan_result_t *scan_results = NULL; // Hash table for storing unique scan results, from inject.c
 
-static int64_t last_sniff_time_us = 0; // timestamp that the last packet was sniffed
-
 static int num_scan_results = 0;
 
-static const uint8_t chan_arr[] = {1, 6, 11};
-static int chan_idx = 2;
+static const uint8_t wifi_channels[NUM_CHANNELS] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+static int curr_chan_idx = 0;
+
+/************************************************************
+ *                 TIMERS AND CALLBACKS                     *
+ *                                                          *
+ ************************************************************/
+
+static void init_timers()
+{
+    // Create probe delay timer
+    esp_timer_create_args_t probe_timer_args = {
+        .callback = &probe_timer_cb,       // Callback function
+        .arg = NULL,                       // Argument passed to the callback
+        .dispatch_method = ESP_TIMER_TASK, // ESP_TIMER_ISR does not seem to be supported for version 5.x
+        // .dispatch_method = ESP_TIMER_ISR, // Call callback in a task context
+        .name = "probe_delay_timer" // Name of the timer (for debugging)
+    };
+
+    // esp_timer_handle_t probe_timer_handle;
+    ESP_ERROR_CHECK(esp_timer_create(&probe_timer_args, &probe_timer_handle));
+
+    // Create a timer for maxChanTime
+    esp_timer_create_args_t maxChan_timer_args = {
+        .callback = &maxChan_timer_cb,     // Callback function
+        .arg = NULL,                       // Argument passed to the callback
+        .dispatch_method = ESP_TIMER_TASK, // ESP_TIMER_ISR does not seem to be supported for version 5.x
+        // .dispatch_method = ESP_TIMER_ISR, // Call callback in a task context
+        .name = "max_chan_timer" // Name of the timer (for debugging)
+    };
+
+    // esp_timer_handle_t maxChan_timer_handle;
+    ESP_ERROR_CHECK(esp_timer_create(&maxChan_timer_args, &maxChan_timer_handle));
+}
+
+static void switch_to_next_channel()
+{
+    if (curr_chan_idx == 13)
+    {
+        finished_dynamo_probe();
+    }
+    curr_chan_idx += 1;
+
+    uint8_t next_chan = wifi_channels[curr_chan_idx];
+
+    ESP_ERROR_CHECK(esp_wifi_set_channel(next_chan, WIFI_SECOND_CHAN_NONE)); // switch channels
+    ESP_LOGI(TAG, "Channel switched to %d : ", next_chan);
+}
+
+static void send_probe_request()
+{
+    esp_wifi_80211_tx(WIFI_IF_STA, probe_request, sizeof(probe_request), false);
+    ESP_LOGI(TAG, "Wildcard probe request sent. Channel : %d ", wifi_channels[curr_chan_idx]);
+}
+
+// cb function triggered when probeDelay expires
+static void probe_timer_cb()
+{
+    // probeDelay expires, trigger an active scan on curr channel
+    send_probe_request();
+    // TODO: HOW TO STORE RESULTS FROM ACTIVE SCAN?
+
+    // switch channel
+    switch_to_next_channel();
+
+    // start probeDelay timer, and wait for 2x, since we performed an active scan
+    ESP_ERROR_CHECK(esp_timer_start_once(probe_timer_handle, PROBE_DEALY_2X * 1000)); // 1,000,000 microseconds = 1 second, this value is (PROBE_DELAY_X * 2) ms
+}
+
+static void maxChan_timer_cb()
+{
+
+    // switch channel
+    switch_to_next_channel();
+
+    // restart the probe delay timer on duration PROBE_DELAY_X because we finished opp-scan
+    ESP_ERROR_CHECK(esp_timer_start_once(probe_timer_handle, PROBE_DELAY_X * 1000)); // 1,000,000 microseconds = 1 second, this value is (PROBE_DELAY_X * 2) ms
+}
+
+static void finished_dynamo_probe()
+{
+    ESP_LOGI(TAG, "FINISHED SCANNING, PROCEED TO AUTH/ASSOCIATION");
+
+    if (esp_timer_is_active(probe_timer_handle))
+    {
+        ESP_ERROR_CHECK(esp_timer_stop(probe_timer_handle));
+    }
+
+    if (esp_timer_is_active(maxChan_timer_handle))
+    {
+        ESP_ERROR_CHECK(esp_timer_stop(maxChan_timer_handle));
+    }
+    return;
+}
 
 /************************************************************
  *                SCAN RESULTS AND HASH                     *
@@ -84,28 +192,20 @@ static inline void IRAM_ATTR add_scan_result(
         // Update the existing entry
         result->channel = channel;
         result->rssi = rssi;
-        result->updated = true; // Mark as updated
-
         if (is_probe_resp)
         {
-            result->recvResponse = 1;
+            result->recvResponse = true;
         }
     }
     else
     {
-        if (is_probe_resp) // only add new entry if it is a probe req, change this later to support probe resp
-        {
-            return;
-        }
-        // Create a new entry
+        // Create a new entry, we have not seen this BSSID before
         result = (scan_result_t *)malloc(sizeof(scan_result_t));
         memcpy(result->bssid, bssid, 6);
         memcpy(result->ssid, ssid, ssid_len);
         result->ssid[ssid_len] = '\0'; // Ensure SSID is null-terminated
         result->channel = channel;
         result->rssi = rssi;
-        result->updated = true; // Mark as updated
-
         // Add to the hash set
         HASH_ADD(hh, scan_results, bssid, 6, result);
     }
@@ -116,11 +216,11 @@ static inline void IRAM_ATTR clear_scan_results()
 {
     scan_result_t *current_entry, *tmp;
 
-    // Iterate over the hash set and reset each entry
-    HASH_ITER(hh, scan_results, current_entry, tmp)
-    {
-        current_entry->updated = false; // Reset the updated flag
-    }
+    // // Iterate over the hash set and reset each entry
+    // HASH_ITER(hh, scan_results, current_entry, tmp)
+    // {
+    //     current_entry->updated = false; // Reset the updated flag
+    // }
 }
 
 // Debug Function to print the number of items in the hash set
@@ -148,19 +248,6 @@ static inline void IRAM_ATTR print_scan_results()
 /************************************************************
  *                      PROBING BEHAVIOR                    *
  ************************************************************/
-static void switch_channels()
-{
-    if (chan_idx + 1 == CHANNELS_SCANNED)
-    {
-        chan_idx = 0;
-    }
-    else
-    {
-        chan_idx += 1;
-    }
-
-    ESP_ERROR_CHECK(esp_wifi_set_channel(chan_arr[chan_idx], WIFI_SECOND_CHAN_NONE)); // switch channels
-}
 
 bool is_probe_request(void *buff)
 {
@@ -176,29 +263,6 @@ bool is_probe_response(void *buff)
     return (payload[0] & 0xFC) == 0x50;
 }
 
-// timer_cb and send_probe_request() can probably be combined for simplicity if not needed
-static void send_probe_request()
-{
-    esp_wifi_80211_tx(WIFI_IF_STA, probe_request, sizeof(probe_request), false);
-    ESP_LOGI(TAG, "Wildcard probe request sent. Channel : %d ", chan_arr[chan_idx]);
-}
-
-static void timer_cb()
-{
-    int64_t now = esp_timer_get_time();
-    int64_t time_since_sniff = now - last_sniff_time_us;
-
-    if (time_since_sniff >= 3000000 || last_sniff_time_us == 0) // this is "time delta" between probe bursts when in a silent env
-    {
-        switch_channels();
-        send_probe_request(); // if no probe detected for 3 seconds (magic number), we probe ourselves (wildcard for now)
-    }
-    else
-    {
-        // ESP_LOGI(TAG, "SKIPPED PROBE");
-    }
-}
-
 // Callback when packets are received in monitor mode
 void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type)
 {
@@ -212,11 +276,22 @@ void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type)
 
     if (!is_probe_req && !is_probe_resp)
     { // drop packet if its not a probe resp or req
+        // keep probe delay timer running
         return;
     }
 
-    switch_channels();
-    last_sniff_time_us = esp_timer_get_time(); // update last time we sniffed
+    // If probe delay active, Stop probe_delay timer upon sniffing a relevant packet, continue to sniff on this chan for maxChanTime
+
+    if (esp_timer_is_active(probe_timer_handle))
+    {
+        ESP_ERROR_CHECK(esp_timer_stop(probe_timer_handle));
+    }
+
+    // Start MaxChanTime timer to dwell on this channel, if we have not already
+    if (!esp_timer_is_active(maxChan_timer_handle))
+    {
+        ESP_ERROR_CHECK(esp_timer_start_once(maxChan_timer_handle, MAX_CHAN_TIME * 1000)); // 1,000,000 microseconds = 1 second, this value is MAX_CHAN_TIME ms
+    }
 
     wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buff;
     uint8_t *payload = ppkt->payload;
@@ -277,7 +352,7 @@ void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type)
 
     scan_result_t *result;
     HASH_FIND(hh, scan_results, bssid, 6, result);
-    int found = 0;
+    bool found = false;
     if (result)
     {
         found = result->recvResponse;
@@ -346,7 +421,7 @@ void wifi_init()
 
     // Set channel.
     // ESP_ERROR_CHECK(esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE));
-    ESP_ERROR_CHECK(esp_wifi_set_channel(chan_arr[chan_idx], WIFI_SECOND_CHAN_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_channel(wifi_channels[curr_chan_idx], WIFI_SECOND_CHAN_NONE));
 
     // Set bandwidth.
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
@@ -355,26 +430,17 @@ void wifi_init()
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(esp_netif_init()); // may be unnecessary
+    ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     // initialize wifi
     wifi_init();
+    init_timers(); // probeDelay, and maxChanTime
 
-    // Create a timer to periodically send probe requests.
-    esp_timer_create_args_t timer_args = {
-        .callback = &timer_cb,             // Callback function
-        .arg = NULL,                       // Argument passed to the callback
-        .dispatch_method = ESP_TIMER_TASK, // ESP_TIEMR_ISR does not seem to be supported for version 5.x
-        // .dispatch_method = ESP_TIMER_ISR, // Call callback in a task context
-        .name = "probe_cb" // Name of the timer (for debugging)
-    };
+    // start probe delay timer, triggers active scan upon expiration if not interrupted
+    ESP_ERROR_CHECK(esp_timer_start_once(probe_timer_handle, PROBE_DELAY_X * 1000)); // 1,000,000 microseconds = 1 second, this value is PROBE_DELAY_X ms
 
-    esp_timer_handle_t timer_handle;
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer_handle));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(timer_handle, PROBE_PERIOD_MS * 1000)); // 1,000,000 microseconds = 1 second
-
-    ESP_LOGI(TAG, "opp-scan start");
+    ESP_LOGI(TAG, "Dynamo-probing start");
 
     // uint8_t mac[6];
     // esp_read_mac(mac, ESP_MAC_WIFI_STA); // Read the MAC address for Wi-Fi station
