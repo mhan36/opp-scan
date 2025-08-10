@@ -11,10 +11,13 @@
 #include "esp_timer.h"
 #include "uthash.h"
 
-#define PROBE_DELAY_X 100
+#define WIFI_SSID "SSID"
+#define WIFI_PASS "PASS"
+
+#define PROBE_DELAY_X 21 // how much delay before each probe
 #define PROBE_DEALY_2X (2 * PROBE_DELAY_X)
-#define MIN_CHAN_TIME 5
-#define MAX_CHAN_TIME 40 // how long we wait on a channel during opp-scan
+#define MIN_CHAN_TIME 30
+#define MAX_CHAN_TIME 100 // how long we wait on a channel during opp-scan
 #define MAX_SCAN_RESULTS 30
 #define NUM_CHANNELS 14 // 14 chan on 2.4 ghz
 
@@ -25,6 +28,7 @@ static void init_timers();
 static void send_probe_request();
 static void finished_dynamo_probe();
 static void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type);
+static inline void IRAM_ATTR print_scan_results();
 
 // Timer handles
 static esp_timer_handle_t probe_timer_handle;
@@ -64,7 +68,7 @@ static uint8_t probe_request[64] = {
     0x32, 0x04, 0x0C, 0x18, 0x30, 0x60 // Extended Supported Rates (6, 12, 24, 54 Mbps)
 };
 
-static const char *TAG = "DEBUG ";
+static const char *TAG = "[ DEBUG ]";
 
 static DRAM_ATTR scan_result_t *scan_results = NULL; // Hash table for storing unique scan results, from inject.c
 
@@ -73,10 +77,47 @@ static int num_scan_results = 0;
 static const uint8_t wifi_channels[NUM_CHANNELS] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
 static int curr_chan_idx = 0;
 
+static bool probe_complete = false;
+
+// Debug Function to print all entries in the hash set
+static inline void IRAM_ATTR print_scan_results()
+{
+    scan_result_t *current_entry, *tmp;
+
+    // Iterate over the hash set and print each entry
+    HASH_ITER(hh, scan_results, current_entry, tmp)
+    {
+        printf("BSSID: %02x:%02x:%02x:%02x:%02x:%02x, SSID: %s, Channel: %d, RSSI: %d dBm\n",
+               current_entry->bssid[0], current_entry->bssid[1], current_entry->bssid[2],
+               current_entry->bssid[3], current_entry->bssid[4], current_entry->bssid[5],
+               current_entry->ssid, current_entry->channel, current_entry->rssi);
+    }
+}
 /************************************************************
  *                 TIMERS AND CALLBACKS                     *
  *                                                          *
  ************************************************************/
+
+// Handler for Wi-Fi and IP events
+// static void event_handler(
+//     void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+// {
+//     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+//     {
+//         esp_wifi_connect();
+//         ESP_LOGI(TAG, "Connecting to AP...");
+//     }
+//     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+//     {
+//         ESP_LOGW(TAG, "Disconnected. Reconnecting...");
+//         esp_wifi_connect();
+//     }
+//     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+//     {
+//         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+//         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+//     }
+// }
 
 static void init_timers()
 {
@@ -107,9 +148,15 @@ static void init_timers()
 
 static void switch_to_next_channel()
 {
-    if (curr_chan_idx == 13)
+    if (probe_complete)
+    {
+        return;
+    }
+
+    if (curr_chan_idx >= NUM_CHANNELS - 1)
     {
         finished_dynamo_probe();
+        return;
     }
     curr_chan_idx += 1;
 
@@ -128,29 +175,54 @@ static void send_probe_request()
 // cb function triggered when probeDelay expires
 static void probe_timer_cb()
 {
+    if (probe_complete)
+    {
+        return;
+    }
     // probeDelay expires, trigger an active scan on curr channel
     send_probe_request();
-    // TODO: HOW TO STORE RESULTS FROM ACTIVE SCAN?
 
-    // switch channel
-    switch_to_next_channel();
+    // Start MaxChanTime timer to dwell on this channel, if we have not already
+    if (!esp_timer_is_active(maxChan_timer_handle))
+    {
+        ESP_ERROR_CHECK(esp_timer_start_once(maxChan_timer_handle, MAX_CHAN_TIME * 1000)); // 1,000,000 microseconds = 1 second, this value is MAX_CHAN_TIME ms
+    }
 
     // start probeDelay timer, and wait for 2x, since we performed an active scan
+    if (esp_timer_is_active(probe_timer_handle))
+    {
+        ESP_ERROR_CHECK(esp_timer_stop(probe_timer_handle));
+    }
     ESP_ERROR_CHECK(esp_timer_start_once(probe_timer_handle, PROBE_DEALY_2X * 1000)); // 1,000,000 microseconds = 1 second, this value is (PROBE_DELAY_X * 2) ms
 }
 
 static void maxChan_timer_cb()
 {
-
+    if (probe_complete)
+    {
+        ESP_LOGI(TAG, "maxChan timer stopped after finished probe");
+        return;
+    }
     // switch channel
     switch_to_next_channel();
 
     // restart the probe delay timer on duration PROBE_DELAY_X because we finished opp-scan
+    if (esp_timer_is_active(probe_timer_handle))
+    {
+        ESP_LOGI(TAG, "RESTART probe timer inside maxChanTimer CB");
+        ESP_ERROR_CHECK(esp_timer_stop(probe_timer_handle));
+    }
     ESP_ERROR_CHECK(esp_timer_start_once(probe_timer_handle, PROBE_DELAY_X * 1000)); // 1,000,000 microseconds = 1 second, this value is (PROBE_DELAY_X * 2) ms
 }
 
 static void finished_dynamo_probe()
 {
+
+    if (probe_complete)
+    {
+        return;
+    }
+    probe_complete = true;
     ESP_LOGI(TAG, "FINISHED SCANNING, PROCEED TO AUTH/ASSOCIATION");
 
     if (esp_timer_is_active(probe_timer_handle))
@@ -162,6 +234,36 @@ static void finished_dynamo_probe()
     {
         ESP_ERROR_CHECK(esp_timer_stop(maxChan_timer_handle));
     }
+    // ESP_ERROR_CHECK(esp_timer_stop(probe_timer_handle));
+    // ESP_ERROR_CHECK(esp_timer_stop(maxChan_timer_handle));
+    ESP_ERROR_CHECK(esp_timer_delete(probe_timer_handle));
+    ESP_ERROR_CHECK(esp_timer_delete(maxChan_timer_handle));
+
+    esp_wifi_set_promiscuous(false);
+    ESP_LOGI(TAG, "Disabled promiscuous mode");
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+
+    print_scan_results();
+
+    // ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+    // ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
+
+    // restart wifi in STA mode
+    ESP_ERROR_CHECK(esp_wifi_stop());
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_connect());
+    ESP_LOGI(TAG, "Connecting to AP...");
+
     return;
 }
 
@@ -230,21 +332,6 @@ static inline void IRAM_ATTR print_num_scan_results()
     printf("Scan results: %u\n", num_items);
 }
 
-// Debug Function to print all entries in the hash set
-static inline void IRAM_ATTR print_scan_results()
-{
-    scan_result_t *current_entry, *tmp;
-
-    // Iterate over the hash set and print each entry
-    HASH_ITER(hh, scan_results, current_entry, tmp)
-    {
-        printf("BSSID: %02x:%02x:%02x:%02x:%02x:%02x, SSID: %s, Channel: %d, RSSI: %d dBm\n",
-               current_entry->bssid[0], current_entry->bssid[1], current_entry->bssid[2],
-               current_entry->bssid[3], current_entry->bssid[4], current_entry->bssid[5],
-               current_entry->ssid, current_entry->channel, current_entry->rssi);
-    }
-}
-
 /************************************************************
  *                      PROBING BEHAVIOR                    *
  ************************************************************/
@@ -266,6 +353,11 @@ bool is_probe_response(void *buff)
 // Callback when packets are received in monitor mode
 void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type)
 {
+    if (probe_complete)
+    {
+        return;
+    }
+
     if (type != WIFI_PKT_MGMT) // filter for management frames only
     {
         return;
@@ -292,6 +384,8 @@ void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type)
     {
         ESP_ERROR_CHECK(esp_timer_start_once(maxChan_timer_handle, MAX_CHAN_TIME * 1000)); // 1,000,000 microseconds = 1 second, this value is MAX_CHAN_TIME ms
     }
+
+    ESP_LOGI(TAG, "****** ENTERED LISTENING HANDLE ****");
 
     wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buff;
     uint8_t *payload = ppkt->payload;
@@ -358,12 +452,12 @@ void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type)
         found = result->recvResponse;
     }
 
-    printf("BSSID: %02x:%02x:%02x:%02x:%02x:%02x, Channel: %d, RSSI: %d, SSID: %s, RESP RECV : %d \n",
-           bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
-           channel,
-           rssi,
-           ssid_str,
-           found);
+    // printf("BSSID: %02x:%02x:%02x:%02x:%02x:%02x, Channel: %d, RSSI: %d, SSID: %s, RESP RECV : %d \n",
+    //        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+    //        channel,
+    //        rssi,
+    //        ssid_str,
+    //        found);
 }
 
 /************************************************************
@@ -413,6 +507,14 @@ void wifi_init()
     // Set protocol.
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B));
 
+    // wifi_config_t wifi_config = {
+    //     .sta = {
+    //         .ssid = WIFI_SSID,
+    //         .password = WIFI_PASS,
+    //         .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+    //     },
+    // };
+
     // Start Wi-Fi stack.
     ESP_ERROR_CHECK(esp_wifi_start());
 
@@ -425,6 +527,8 @@ void wifi_init()
 
     // Set bandwidth.
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
+
+    // ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 }
 
 void app_main(void)
