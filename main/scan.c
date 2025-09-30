@@ -16,8 +16,10 @@
 
 // times are in ms
 #define PROBE_DELAY 20      // how much delay before each burst of probes
-#define INTERFRAME_SPACE 1  // time between each 802.11 probe request frame within a burst
-#define CHAN_DWELL_TIME 10  // how long we stay on channel after hearing a probe
+#define PROBE_INTERVAL 30   // time between each 802.11 probe request frame within a burst
+#define NUM_PROBES 3        // number of probe requests in each burst
+#define CHAN_DWELL_TIME 100 // how long we stay on channel for each "probe event"
+// #define LISTEN_TIME 10 //how long we listen on the channel for responses
 #define SCAN_INTERVAL 60000 // how long each we wait between scan events
 #define MAX_SCAN_RESULTS 30 // how many results we store
 #define NUM_CHANNELS 14     // 14 chan on 2.4 ghz
