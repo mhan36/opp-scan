@@ -175,7 +175,7 @@ static void switch_to_next_channel()
 
 static void send_probe_request()
 {
-    esp_wifi_80211_tx(WIFI_IF_STA, probe_request, sizeof(probe_request), false);
+    ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_STA, probe_request, sizeof(probe_request), false));
     ESP_LOGI(PRINT, "Wildcard probe request sent. Channel : %d ", wifi_channels[curr_chan_idx]);
 }
 
