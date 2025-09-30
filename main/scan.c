@@ -14,10 +14,11 @@
 #define WIFI_SSID "ssid"
 #define WIFI_PASS "pass"
 
+// times are in ms
 #define PROBE_DELAY 20      // how much delay before each burst of probes
 #define INTERFRAME_SPACE 1  // time between each 802.11 probe request frame within a burst
 #define CHAN_DWELL_TIME 10  // how long we stay on channel after hearing a probe
-#define SCAN_INTERVAL 10    // how long each we wait between scan events, scale by 1,000,000 for microsecond to second conversion
+#define SCAN_INTERVAL 60000 // how long each we wait between scan events
 #define MAX_SCAN_RESULTS 30 // how many results we store
 #define NUM_CHANNELS 14     // 14 chan on 2.4 ghz
 
@@ -70,7 +71,7 @@ static uint8_t probe_request[64] = {
 };
 
 static const char *PRINT = "[ PRINT ]";
-static const char *DEBUG = "[ DEBUG ]";
+// static const char *DEBUG = "[ DEBUG ]";
 
 static DRAM_ATTR scan_result_t *scan_results = NULL; // Hash table for storing unique scan results, from inject.c
 
@@ -161,7 +162,15 @@ static void switch_to_next_channel()
     uint8_t next_chan = wifi_channels[curr_chan_idx];
 
     ESP_ERROR_CHECK(esp_wifi_set_channel(next_chan, WIFI_SECOND_CHAN_NONE)); // switch channels
-    ESP_LOGI(PRINT, "Channel switched to %d : ", next_chan);
+    // ESP_LOGI(PRINT, "Channel switched to %d : ", next_chan);
+
+    // restart the probe delay timer on duration PROBE_DELAY because we finished scanning this channel
+    if (esp_timer_is_active(probe_timer_handler))
+    {
+        ESP_ERROR_CHECK(esp_timer_stop(probe_timer_handler));
+    }
+    ESP_LOGI(PRINT, "RESTART PROBE TIMER ON CHAN %d", next_chan);
+    ESP_ERROR_CHECK(esp_timer_start_once(probe_timer_handler, PROBE_DELAY * 1000)); // 1,000,000 microseconds = 1 second, this value is PROBE_DELAY ms
 }
 
 static void send_probe_request()
@@ -187,23 +196,24 @@ static void probe_timer_cb()
     //     ESP_ERROR_CHECK(esp_timer_start_once(chanDwell_timer_handler, CHAN_DWELL_TIME * 1000)); // 1,000,000 microseconds = 1 second, this value is CHAN_DWELL_TIME ms
     // }
 
-    // refresh chanDwell timer, in case we somehow triggered it before probe_delay expired
+    // refresh chanDwell timer, in case we started it before probe_delay expired
     if (esp_timer_is_active(chanDwell_timer_handler))
     {
-        ESP_LOGI(PRINT, "RESTART PROBE TIMER INSIDE probe timer cb");
         ESP_ERROR_CHECK(esp_timer_stop(chanDwell_timer_handler));
     }
-    else
+
+    if (!esp_timer_is_active(chanDwell_timer_handler))
     {
+        ESP_LOGI(PRINT, "START CHAN DWELL LISTENING AFTER SENDING PROBE");
         ESP_ERROR_CHECK(esp_timer_start_once(chanDwell_timer_handler, PROBE_DELAY * 1000)); // 1,000,000 microseconds = 1 second, this value is PROBE_DELAY ms
     }
 
-    // start probeDelay timer again for next channel
-    if (esp_timer_is_active(probe_timer_handler))
-    {
-        ESP_ERROR_CHECK(esp_timer_stop(probe_timer_handler));
-    }
-    ESP_ERROR_CHECK(esp_timer_start_once(probe_timer_handler, PROBE_DELAY * 1000)); // 1,000,000 microseconds = 1 second, this value is PROBE_DELAY
+    // // start probeDelay timer again for next channel
+    // if (esp_timer_is_active(probe_timer_handler))
+    // {
+    //     ESP_ERROR_CHECK(esp_timer_stop(probe_timer_handler));
+    // }
+    // ESP_ERROR_CHECK(esp_timer_start_once(probe_timer_handler, PROBE_DELAY * 1000)); // 1,000,000 microseconds = 1 second, this value is PROBE_DELAY
 }
 
 // triggered when chanDwell expires
@@ -217,14 +227,6 @@ static void chanDwell_timer_cb()
 
     // switch channel, only in chanDwell because we want to dwell on the channel after sending a probe, or hear a probe being transmitted
     switch_to_next_channel();
-
-    // restart the probe delay timer on duration PROBE_DELAY because we finished scanning this channel
-    if (esp_timer_is_active(probe_timer_handler))
-    {
-        ESP_LOGI(PRINT, "RESTART PROBE TIMER INSIDE chanDWELL timer cb");
-        ESP_ERROR_CHECK(esp_timer_stop(probe_timer_handler));
-    }
-    ESP_ERROR_CHECK(esp_timer_start_once(probe_timer_handler, PROBE_DELAY * 1000)); // 1,000,000 microseconds = 1 second, this value is PROBE_DELAY ms
 }
 
 static void finished_dynamo_probe()
@@ -247,6 +249,7 @@ static void finished_dynamo_probe()
     {
         ESP_ERROR_CHECK(esp_timer_stop(chanDwell_timer_handler));
     }
+    ESP_LOGI(PRINT, "STOP ALL TIMERS");
     ESP_ERROR_CHECK(esp_timer_delete(probe_timer_handler));
     ESP_ERROR_CHECK(esp_timer_delete(chanDwell_timer_handler));
 
@@ -383,7 +386,14 @@ void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type)
         return;
     }
 
-    ESP_LOGI(PRINT, "####### PROBE REQUEST SNIIFED #######");
+    if (is_probe_req)
+    {
+        ESP_LOGI(PRINT, "####### PROBE REQUEST SNIIFED #######");
+    }
+    else if (is_probe_resp)
+    {
+        ESP_LOGI(PRINT, "####### PROBE RESPONSE SNIFFED #######");
+    }
 
     // If probe delay active, Stop probe_delay timer upon sniffing a relevant packet, continue to sniff on this chan for chanDwell
 
@@ -391,14 +401,27 @@ void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type)
     {
         ESP_LOGI(PRINT, "****** STOP PROBE TIMER IN LISTEN HANDLER ****");
         ESP_ERROR_CHECK(esp_timer_stop(probe_timer_handler));
+
+        // Start chanDwell timer on this channel, if it has not already been started by a previous listen event
+        // if it has been started by probe_delay expiring, we do not start
+        if (!esp_timer_is_active(chanDwell_timer_handler))
+        {
+            ESP_LOGI(PRINT, "****** STARTED CHAN DWELL TIMER IN LISTEN HANDLER ****");
+            ESP_ERROR_CHECK(esp_timer_start_once(chanDwell_timer_handler, CHAN_DWELL_TIME * 1000)); // 1,000,000 microseconds = 1 second, this value is CHAN_DWELL_TIME ms
+        }
+    }
+    else
+    {
+        ESP_LOGI(PRINT, "****** PROBE DELAY IS NOT ACTIVE ****");
     }
 
-    // Start chanDwell timer on this channel, if it has not already been started by a previous listen event
-    if (!esp_timer_is_active(chanDwell_timer_handler))
-    {
-        ESP_LOGI(PRINT, "****** STARTED CHAN DWELL TIMER IN LISTEN HANDLER ****");
-        ESP_ERROR_CHECK(esp_timer_start_once(chanDwell_timer_handler, CHAN_DWELL_TIME * 1000)); // 1,000,000 microseconds = 1 second, this value is CHAN_DWELL_TIME ms
-    }
+    // // Start chanDwell timer on this channel, if it has not already been started by a previous listen event
+    // // if it has been started by probe_delay expiring, we do not start
+    // if (!esp_timer_is_active(chanDwell_timer_handler))
+    // {
+    //     ESP_LOGI(PRINT, "****** STARTED CHAN DWELL TIMER IN LISTEN HANDLER ****");
+    //     ESP_ERROR_CHECK(esp_timer_start_once(chanDwell_timer_handler, CHAN_DWELL_TIME * 1000)); // 1,000,000 microseconds = 1 second, this value is CHAN_DWELL_TIME ms
+    // }
 
     wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buff;
     uint8_t *payload = ppkt->payload;
@@ -458,13 +481,13 @@ void IRAM_ATTR listen_handler(void *buff, wifi_promiscuous_pkt_type_t type)
     //     return;
     // }
 
-    scan_result_t *result;
-    HASH_FIND(hh, scan_results, bssid, 6, result);
-    bool found = false;
-    if (result)
-    {
-        found = result->recvResponse;
-    }
+    // scan_result_t *result;
+    // HASH_FIND(hh, scan_results, bssid, 6, result);
+    // bool found = false;
+    // if (result)
+    // {
+    //     found = result->recvResponse;
+    // }
 
     // printf("BSSID: %02x:%02x:%02x:%02x:%02x:%02x, Channel: %d, RSSI: %d, SSID: %s, RESP RECV : %d \n",
     //        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
@@ -558,6 +581,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_start_once(probe_timer_handler, PROBE_DELAY * 1000)); // 1,000,000 microseconds = 1 second, this value is PROBE_DELAY ms
 
     ESP_LOGI(PRINT, "~~~~~~~~~~~~~~~~~~~~~~ START  ~~~~~~~~~~~~~~~~~~~~~~");
+    ESP_LOGI(PRINT, "FIRST PROBE DELAY STARTS HERE");
 
     // uint8_t mac[6];
     // esp_read_mac(mac, ESP_MAC_WIFI_STA); // Read the MAC address for Wi-Fi station
